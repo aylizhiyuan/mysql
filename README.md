@@ -1266,6 +1266,102 @@ Compact 和 Redundant 格式最大的不同就是记录格式的第一个部分�
 
 
 
+## 14. LRU缓存
+
+实际上就是一个缓存的机制，创建一个缓存池，支持get和put操作，获取数据get,如果存在则返回，如果不存在则返回-1
+
+写入数据，如果不存在则写入数据值，当缓存到达上限的时候，它应该在写入新数据之前删除最近最少使用的数据，为新的数据提供空间
+
+INNODB在LRU的基础上做了一些改动，加入了midpoint位置，新读取到的页，虽然是最新访问的页，但并不是直接放入到LRU列表的首部，而是放在LRU列表的midpoint位置，该位置通常位于列表的5/8处。
+
+在innoDB中，把midpoint之后的列表称为是old列表，之前的列表称为new列表，可以简单的理解为new列表中的页都是最为活跃的热点数据
+
+在LRU列表中的页被修改后，被称之为脏页，即缓冲池中的页和磁盘上的页的数据产生了不一致的现象，这时候数据库会通过checkpoint机制将脏页刷新回磁盘，这时候这个页可能会进入到flush列表中
+
+> 你可以理解为所有的mysql的数据都要先从磁盘达到内存，在内存中操作完成之后再返回到磁盘中去
+
+## 15. checkpoint技术
+
+缓冲池的目的就是为了协调cpu和磁盘之间的速度，因此页的操作首先都是在缓冲池中完成的。假设一条update或delete改变了页的记录，那么此时页是脏的，即缓存池中的页的版本要比磁盘的新，数据库需要将新版本的页从缓冲池刷新到磁盘中去
+
+倘若每次一个页发生变化，就将新页的版本刷新到磁盘，那么开销非常的巨大。所以采取的策略是write ahead log,即当事物提交的时候，先写重做日志，再修改页，当由于发生了宕机而导致数据丢失的时候，通过重做日志来完成数据的恢复，这也是ACID中D持久性的要求
+
+但是重做日志不可能无限的大，并且恢复到什么时候什么状态也无法确定，所以这时候就需要checkpoint，数据库只需要对checkpoint之后的重做日志进行恢复即可
+
+- sharp checkpoint
+- fuzzy checkpoint
+
+sharp checkpoint发生在数据库关闭的时候将所有的脏页都刷新会磁盘
+
+fuzzy checkpoint只刷新一部分脏页
+
+- master thread checkpoint 差不多每秒或每十秒速度从缓存池的脏页列表中刷新一定比例的页回磁盘，这个过程是异步的
+- flush_LRU_list checkpoint LRU中的页出现了脏页,如果LRU列表中没有足够的空闲页，将LRU末尾的页移除的时候，如果有脏页，则进行checkpoint
+- async/sync flush checkpoint 重做日志不可用的情况下，需要强制将一些页刷新会磁盘
+- dirty page to much 脏页数量太多，强制checkpoint
+
+## 16. innodb的线程
+
+- master thread 负责将缓冲池中的数据异步刷新到磁盘，帮扩脏页的刷新、合并插入缓存、undo页的回收
+
+- IO thread 4个write线程、4个read线程、一个insert buffer线程和一个Log thread
+
+### master thread
+
+其内部有多个Loop组成，主循环loop、后台循环loop、刷新loop、暂停loop，主线程会在这些loop中进行切换
+
+1. 主循环loop
+
+实例代码:
+
+    void master_thread(){
+        loop:
+        for(int i=0;i<10;i++){
+            do thing once per second
+            sleep 1 second if necessary
+        }
+        do things once per ten seconds
+        goto loop;
+    }
+
+其中每秒一次的操作包括:
+
+- 日志缓冲刷新到磁盘、即使这个事务没有提交
+- 合并插入缓冲(可能)
+- 之多刷新100个innodb的缓冲池的脏页到磁盘(可能)
+- 如果当前没有用户活动切换到background loop(可能)
+
+每十秒的操作包括:
+
+- 刷新100个脏页到磁盘(可能)
+- 合并之多5个插入缓冲
+- 将日志缓冲刷新到磁盘
+- 删除无用的udo页
+- 刷新100个或者10个脏页到磁盘
+
+2. background loop
+
+- 删除无用的uodo页
+- 合并20个插入缓冲
+- 调回到主循环
+- 不断刷新100个页直到符合条件(可能)
+
+## 17. INNODB关键的特性
+
+### 插入缓存
+
+它主要应用在非唯一辅助索引的插入操作
+
+了解不多，看的也不是很通透把反正....
+
+
+### 两次写
+
+### 自适应哈希索引
+
+### 异步IO
+
+### 刷新临近页
 
 
 
