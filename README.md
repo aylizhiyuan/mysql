@@ -1235,7 +1235,7 @@ Compact 和 Redundant 格式最大的不同就是记录格式的第一个部分�
 
 数据库将所有的非聚集索引划分为辅助索引，但是它的叶子节点中不包含行记录的全部信息
 
-仅包含索引中的所有键和一个用于查找对应行记录的书签，这个书签就是当前记录的主键
+仅���含索引中的所有键和一个用于查找对应行记录的书签，这个书签就是当前记录的主键
 
 
 ![](./images/index17.png)
@@ -1346,22 +1346,81 @@ fuzzy checkpoint只刷新一部分脏页
 - 调回到主循环
 - 不断刷新100个页直到符合条件(可能)
 
-## 17. INNODB关键的特性
+## 17. 详细总结事务的具体实现
 
-### 插入缓存
+这里，对事务的实现来一次总结，上面讲了那么多，实际上，我们只需要关心innoDB存储引擎是如何实现事务的ACID的即可。
 
-它主要应用在非唯一辅助索引的插入操作
+事务的隔离性是由锁来实现的，而事务的原子性、一致性和持久性是通过数据库的redo log和undo log实现的。redo log称为重做日志，用来保证事务的原子性和持久性。undo log来保证事务的一致性
 
-了解不多，看的也不是很通透把反正....
+### redo
+
+重做日志来实现事务的持久性，其由两部分组成：一个是内存中的重做日志缓冲redo log buffer,其是易丢失的，二是重做日志文件redo log file,其实持久性的
+
+当事务提交的时候，必须先将该事务的所有日志写入到重做日志文件进行持久化，待事务的commit操作完成后才算完成。这里的日志指的就是重做日志，由redo log和undo log组成。redo log保证事务的持久性，undo log保证事务的回滚以及MVVC的功能。redo log基本都是顺序写的，在数据库运行的时候不需要对redo log的文件进行读取操作。而undo log是需要进行随机读写的
+
+为了确保每次日志都写入到事务日志文件中，在每次将log buffer中的日志写入日志文件过程中都会调用一次操作系统的fsync操作，因为mysql是工作在用户控件的，而log buffer处于用户空间的内存中，要写入到磁盘中log file中去(redo:ib_logfineN文件,undo:share tablespace或.ibd文件)，中间还要经过操作系统内核空间的os buffer,调用fsync的作用就是将os buffer中的日志刷新到磁盘的log file中
+
+![](./images/redo1.png)
+
+mysql支持用户自定义在commit的时候如何将log buffer中的日志刷新到log file中去。这种控制通过变量 innodb_flush_log_at_trx_commit 的值来决定，该变量有3个值：0，1，2,默认为1，这个变量只控制commit动作是否刷新log buffer到磁盘
+
+- 当设置为1的时候，事务每次提交都会将Log buffer中的日志写入os buffer并调用fsync()刷新到Log file on disk中
+
+- 当设置为0的时候，事务提交时候不会讲log buffer中日志写入到os buffer,而是每秒写入os buffer并调用fsync()写入到log file on disk中。也就是说设置0时是每秒刷新写入到磁盘中
+
+- 当设置为2的时候，每次提交都仅写入到os buffer，然后是每秒调用fsync()将os buffer中的日志写入到log file on disk
+
+![](./images/redo2.png)
+
+### 日志块(log block)
+
+innoDB存储引擎中，redo log是以块为单位进行存储的，每个块占512个字节，这称为redo log block.
+
+每个redo log block由3个部分组成：日志块头、日志块尾、日志主体。其中日志块头占12字节，日志块尾占用8字节，所以每个redo log block的日志主体部分只有512-8-12=492个字节
+
+![](./images/redo3.png)
+
+上面所说的是一个日志块的内容，在redo log buffer或者redo log file on disk中，由很多log block组成。如下图：
+
+![](./images/redo4.png)
+
+### log group和redo log file
+
+log group表示的是redo log group,一个组内由多个大小相同的redo log file组成，组内redo log file数量由标量innodb_log_files_group决定，默认为2
 
 
-### 两次写
+在每个组的第一个redo log file中，前2KB记录4个特定的部分，从2KB之后才开始记录log block。除了第一个redo log file中会记录，log group中的其他log file不会记录这2KB，但是却会腾出这2KB的空间。如下
 
-### 自适应哈希索引
+![](./images/redo5.png)
 
-### 异步IO
+redo log file的大小对innodb的性能影响非常大，设置的太大，恢复的时候就会时间较长，设置的太小，就会导致在写redo log的时候循环切换redo log file。
 
-### 刷新临近页
+在innodb将log buffer中的redo log block刷到这些log file中时，会以追加写入的方式循环轮训写入。即先在第一个log file（即ib_logfile0）的尾部追加写，直到满了之后向第二个log file（即ib_logfile1）写。当第二个log file满了会清空一部分第一个log file继续写入。
+
+
+### redo log的格式
+
+它也是基于页的形式记录的，页是16kb的大小，一个页可以存放非常多的log block(每个512个字节)
+
+其中log block中492字节的部分是log body，该log body的格式分为4部分：
+
+- redo_log_type：占用1个字节，表示redo log的日志类型。
+- space：表示表空间的ID，采用压缩的方式后，占用的空间可能小于4字节。
+- page_no：表示页的偏移量，同样是压缩过的。
+- redo_log_body表示每个重做日志的数据部分，恢复时会调用相应的函数进行解析。例如insert语句和delete语句写入redo log的内容是不一样的。
+
+如下图，分别是insert和delete大致的记录方式。
+
+![](./images/redo6.png)
+
+### 日志刷新的规则
+
+
+
+
+
+
+
 
 
 
