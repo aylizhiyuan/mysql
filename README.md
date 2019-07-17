@@ -1278,7 +1278,9 @@ INNODB在LRU的基础上做了一些改动，加入了midpoint位置，新读取
 
 在LRU列表中的页被修改后，被称之为脏页，即缓冲池中的页和磁盘上的页的数据产生了不一致的现象，这时候数据库会通过checkpoint机制将脏页刷新回磁盘，这时候这个页可能会进入到flush列表中
 
-> 你可以理解为所有的mysql的数据都要先从磁盘达到内存，在内存中操作完成之后再返回到磁盘中去
+> 你可以理解为所有的mysql的数据都要先从磁盘达到内存，在内存中操作完成之后再返回到磁盘中去,缓冲池中有数据缓冲和日志缓冲两种
+
+![](./images/buffer.png)
 
 ## 15. checkpoint技术
 
@@ -1358,7 +1360,7 @@ fuzzy checkpoint只刷新一部分脏页
 
 当事务提交的时候，必须先将该事务的所有日志写入到重做日志文件进行持久化，待事务的commit操作完成后才算完成。这里的日志指的就是重做日志，由redo log和undo log组成。redo log保证事务的持久性，undo log保证事务的回滚以及MVVC的功能。redo log基本都是顺序写的，在数据库运行的时候不需要对redo log的文件进行读取操作。而undo log是需要进行随机读写的
 
-为了确保每次日志都写入到事务日志文件中，在每次将log buffer中的日志写入日志文件过程中都会调用一次操作系统的fsync操作，因为mysql是工作在用户控件的，而log buffer处于用户空间的内存中，要写入到磁盘中log file中去(redo:ib_logfineN文件,undo:share tablespace或.ibd文件)，中间还要经过操作系统内核空间的os buffer,调用fsync的作用就是将os buffer中的日志刷新到磁盘的log file中
+为了确保每次日志都写入到事务日志文件中，在每次将log buffer中的日志写入日志文件过程中都会调用一次操作系统的fsync操作，因为mysql是工作在用户空间的，而log buffer处于用户空间的内存中，要写入到磁盘中log file中去(redo:ib_logfineN文件,undo:share tablespace或.ibd文件)，中间还要经过操作系统内核空间的os buffer,调用fsync的作用就是将os buffer中的日志刷新到磁盘的log file中
 
 ![](./images/redo1.png)
 
@@ -1415,9 +1417,77 @@ redo log file的大小对innodb的性能影响非常大，设置的太大，恢�
 
 ### 日志刷新的规则
 
+log buffer中未刷新到磁盘的日志叫做脏日志(dirty log)
+
+刷日志到磁盘有以下几个情况：
+
+1. 发出commit动作的时候
+2. 每秒刷一次。这个刷日志的频率由innodb_flush_log_at_timeout值来决定，默认是1秒
+3. 当log buffer中已经使用的内存超过一半的时候
+4. 当有checkpoint的时候
+
+### 数据页刷新磁盘的规则以及checkpoint
+
+内存中(buffer pool)未刷新到磁盘的数据成为脏数据。由于数据和日志都以页的形式存在，所以脏页表示脏数据和脏日志
+
+所以，刷新到磁盘的时候，不仅仅是日志，脏的数据页也要刷新到磁盘
+
+在innodb中，数据刷新的规则只有一个：checkpoint，checkpoint触发后，会将buffer中脏的数据页和脏日志页都刷新到磁盘
+
+### LSN的详细分析
+
+LSN称为日志的逻辑序列号(log sequence number)在innodb存储引擎中
+
+1. 首先修改缓冲池中的数据页，并在数据页中记录LSN,称为data_in_buffer_lsn
+
+2. 并且在修改数据页的同时向redo log buffer写入redo log，并记录下 对应的LSN,称为redo_log_in_buffer_lsn
+
+3. 写完buffer的日志后，当触发了日志刷新磁盘的几个规则后，会向redo log file on disk刷入重做日志，并在该文件中记录对应的LSN，称为redo_log_on_disk_lsn
+
+4. 数据页不可能永远只停留在内存，在某些情况下回触发checkpoint将内存中的脏页刷到磁盘，所以在本次checkpoint脏页刷新结束后，在redo log中记录checkpoint的LSN的位置，称为checkpoint_lsn
+
+5. 要记录checkpoint所在位置很快，只需简单的设置一个标志即可，但是刷数据页并不一定很快，例如这一次checkpoint要刷入的数据页非常多。也就是说要刷入所有的数据页需要一定的时间来完成，中途刷入的每个数据页都会记下当前页所在的LSN，暂且称之为data_page_on_disk_lsn
+
+![](./images/redo7.png)
+
+上图中，从上到下的横线分别代表：时间轴、buffer中数据页中记录的LSN(data_in_buffer_lsn)、磁盘中数据页中记录的LSN(data_page_on_disk_lsn)、buffer中重做日志记录的LSN(redo_log_in_buffer_lsn)、磁盘中重做日志文件中记录的LSN(redo_log_on_disk_lsn)以及检查点记录的LSN(checkpoint_lsn)。
+
+假设在最初时(12:0:00)所有的日志页和数据页都完成了刷盘，也记录好了检查点的LSN，这时它们的LSN都是完全一致的。
+
+假设此时开启了一个事务，并立刻执行了一个update操作，执行完成后，buffer中的数据页和redo log都记录好了更新后的LSN值，假设为110。这时候如果执行 show engine innodb status 查看各LSN的值，即图中①处的位置状态，结果会是：
+
+log sequence number(110) > log flushed up to(100) = pages flushed up to = last checkpoint at
+
+之后又执行了一个delete语句，LSN增长到150。等到12:00:01时，触发redo log刷盘的规则(其中有一个规则是 innodb_flush_log_at_timeout 控制的默认日志刷盘频率为1秒)，这时redo log file on disk中的LSN会更新到和redo log in buffer的LSN一样，所以都等于150，这时 show engine innodb status ，即图中②的位置，结果将会是：
+
+log sequence number(150) = log flushed up to > pages flushed up to(100) = last checkpoint at
+
+再之后，执行了一个update语句，缓存中的LSN将增长到300，即图中③的位置。
+
+假设随后检查点出现，即图中④的位置，正如前面所说，检查点会触发数据页和日志页刷盘，但需要一定的时间来完成，所以在数据页刷盘还未完成时，检查点的LSN还是上一次检查点的LSN，但此时磁盘上数据页和日志页的LSN已经增长了，即：
+
+log sequence number > log flushed up to 和 pages flushed up to > last checkpoint at
+
+但是log flushed up to和pages flushed up to的大小无法确定，因为日志刷盘可能快于数据刷盘，也可能等于，还可能是慢于。但是checkpoint机制有保护数据刷盘速度是慢于日志刷盘的：当数据刷盘速度超过日志刷盘时，将会暂时停止数据刷盘，等待日志刷盘进度超过数据刷盘。
+
+等到数据页和日志页刷盘完毕，即到了位置⑤的时候，所有的LSN都等于300。
+
+随着时间的推移到了12:00:02，即图中位置⑥，又触发了日志刷盘的规则，但此时buffer中的日志LSN和磁盘中的日志LSN是一致的，所以不执行日志刷盘，即此时 show engine innodb status 时各种lsn都相等。
+
+随后执行了一个insert语句，假设buffer中的LSN增长到了800，即图中位置⑦。此时各种LSN的大小和位置①时一样。
+
+随后执行了提交动作，即位置⑧。默认情况下，提交动作会触发日志刷盘，但不会触发数据刷盘，所以 show engine innodb status 的结果是：
+
+log sequence number = log flushed up to > pages flushed up to = last checkpoint at
+
+最后随着时间的推移，检查点再次出现，即图中位置⑨。但是这次检查点不会触发日志刷盘，因为日志的LSN在检查点出现之前已经同步了。假设这次数据刷盘速度极快，快到一瞬间内完成而无法捕捉到状态的变化，这时 show engine innodb status 的结果将是各种LSN相等。
 
 
+### undo log
 
+undo log和redo log记录物理日志不一样，它是逻辑日志。可以认为当delete一条记录时，undo log中会记录一条对应的insert记录，反之亦然，当update一条记录时，它记录一条对应相反的update记录。
+
+当执行rollback时，就可以从undo log中的逻辑记录读取到相应的内容并进行回滚。有时候应用到行版本控制的时候，也是通过undo log来实现的：当读取的某一行被其他事务锁定时，它可以从undo log中分析出该行记录以前的数据是什么，从而提供该行版本信息，让用户实现非锁定一致性读取
 
 
 
